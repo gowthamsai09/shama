@@ -71,6 +71,7 @@ class Neo4jGraphStore(GraphStore):
     async def upsert_node(self, node: SemanticNode) -> None:
         driver = self._driver_check()
         async with driver.session(database=self._database) as session:
+            # Write the node
             await session.run(
                 """
                 MERGE (n:SemanticNode {id: $id})
@@ -83,7 +84,8 @@ class Neo4jGraphStore(GraphStore):
                     n.status        = $status,
                     n.created_at    = $created_at,
                     n.updated_at    = $updated_at,
-                    n.importance    = $importance
+                    n.importance    = $importance,
+                    n.name          = $value
                 """,
                 id=str(node.id),
                 agent_id=node.agent_id,
@@ -91,13 +93,29 @@ class Neo4jGraphStore(GraphStore):
                 relation=node.relation,
                 value=node.value,
                 content=node.content,
-                confidence=node.confidence,
+                confidence=node.current_confidence,
                 status=node.status.value,
                 created_at=node.created_at.isoformat(),
                 updated_at=node.updated_at.isoformat(),
                 importance=node.importance,
             )
 
+            # Auto-link to existing nodes with same entity (SHAMA knows these facts are related)
+            await session.run(
+                """
+                MATCH (new:SemanticNode {id: $id})
+                MATCH (existing:SemanticNode)
+                WHERE existing.agent_id = $agent_id
+                  AND existing.id <> $id
+                  AND existing.entity = $entity
+                  AND existing.status <> 'deprecated'
+                MERGE (new)-[:SAME_ENTITY]->(existing)
+                """,
+                id=str(node.id),
+                agent_id=node.agent_id,
+                entity=node.entity,
+            )
+            
     async def upsert_relation(
         self,
         from_id: UUID,

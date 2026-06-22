@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "shama"
-version = "0.1.0"
+version = "0.1.1"
 description = "Self-Healing Agent Memory Architecture — an immune system for AI agent memory"
 authors = [
     { name = "Gowtham Sai Yadlapalli", email = "gowthamsaiyadlapalli1234@gmail.com" }

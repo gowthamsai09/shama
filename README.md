@@ -98,6 +98,7 @@ RECALL (query string)
   └► Trim to 4000 token budget
   └► Return RetrievedContext with confidence-annotated memories
 ```
+Semantic nodes sharing the same entity are automatically linked with `SAME_ENTITY` edges in the knowledge graph, no manual relationship wiring needed.
 
 ### Confidence Half-Life
 
@@ -219,7 +220,7 @@ pip install shama[huggingface-local]
 Verify installation:
 ```bash
 python -c "import shama; print(shama.__version__)"
-# Expected: 0.1.0
+# Expected: 0.1.1
 ```
 
 ---
