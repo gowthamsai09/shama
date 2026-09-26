@@ -1,15 +1,22 @@
 """
-Core test suite for SHAMA.
+Core unit test suite for SHAMA v0.1.2.
 Uses in-memory mocks for all external dependencies -
-no Qdrant, Neo4j, or Redis required to run tests.
+no Qdrant, Neo4j, Redis, or API keys required.
+
+Phase 1 additions vs v0.1.1:
+  - TestDegradedMode      : Redis down, Neo4j down, both down
+  - TestLLMRetry          : _call_with_retry logic, LLMUnavailableError propagation
+  - TestStoreAvailability : available flag on real store classes (no Docker needed)
 """
 
 from __future__ import annotations
-import math
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import UUID, uuid4
+
 import pytest
+
 from shama.core.models import (
     DEFAULT_CONFIG,
     EpisodicNode,
@@ -18,319 +25,91 @@ from shama.core.models import (
     SemanticNode,
     ShamaConfig,
 )
+from shama.core.exceptions import LLMUnavailableError
 from shama.healing.decay import DecayEngine
-from shama.core.interfaces import (
-    AuditStore,
-    CacheStore,
-    EmbeddingProvider,
-    GraphStore,
-    LLMProvider,
-    VectorStore,
-)
-from shama.core.models import AuditEvent
+from shama.core.interfaces import CacheStore, GraphStore
 
-# In-memory mock implementations - no external dependencies
-class MockVectorStore(VectorStore):
-    def __init__(self):
-        self.episodic: dict[UUID, EpisodicNode] = {}
-        self.semantic: dict[UUID, SemanticNode] = {}
 
-    async def upsert_episodic(self, node: EpisodicNode) -> None:
-        self.episodic[node.id] = node
+#  Unavailable store stubs (defined here - NOT imported from conftest) 
+# conftest.py is a pytest plugin file, not an importable module.
+# These stubs live here so TestDegradedMode can instantiate them directly.
 
-    async def upsert_semantic(self, node: SemanticNode) -> None:
-        self.semantic[node.id] = node
+class _UnavailableGraphStore(GraphStore):
+    """Simulates Neo4j completely down. available=False, all ops are no-ops."""
 
-    async def search_episodic(self, query_embedding, agent_id, top_k=10, min_confidence=0.0, filters=None):
-        results = []
-        for node in self.episodic.values():
-            if node.agent_id == agent_id and node.confidence >= min_confidence:
-                results.append(MemoryResult(
-                    node_id=node.id, node_type="episodic", content=node.content,
-                    relevance_score=0.9, confidence=node.confidence, combined_score=0.9,
-                    source=node.source, created_at=node.created_at,
-                ))
-        return results[:top_k]
+    def __init__(self) -> None:
+        self.available: bool = False
 
-    async def search_semantic(self, query_embedding, agent_id, top_k=10, min_confidence=0.0, filters=None):
-        results = []
-        for node in self.semantic.values():
-            if node.agent_id == agent_id and node.confidence >= min_confidence:
-                results.append(MemoryResult(
-                    node_id=node.id, node_type="semantic", content=node.content,
-                    relevance_score=0.85, confidence=node.confidence, combined_score=0.85,
-                    source=node.source, created_at=node.created_at,
-                ))
-        return results[:top_k]
-
-    async def get_episodic(self, node_id: UUID) -> Optional[EpisodicNode]:
-        return self.episodic.get(node_id)
-
-    async def get_semantic(self, node_id: UUID) -> Optional[SemanticNode]:
-        return self.semantic.get(node_id)
-
-    async def update_episodic_status(self, node_id: UUID, **fields) -> None:
-        if node_id in self.episodic:
-            node = self.episodic[node_id]
-            for k, v in fields.items():
-                if hasattr(node, k):
-                    object.__setattr__(node, k, v)
-
-    async def update_semantic_status(self, node_id: UUID, **fields) -> None:
-        if node_id in self.semantic:
-            node = self.semantic[node_id]
-            for k, v in fields.items():
-                if hasattr(node, k):
-                    object.__setattr__(node, k, v)
-
-    async def get_nodes_below_confidence(self, agent_id, threshold, node_type="all"):
-        results = []
-        if node_type in ("all", "episodic"):
-            for node in self.episodic.values():
-                if node.agent_id == agent_id and node.confidence < threshold:
-                    results.append({"id": str(node.id), "node_type": "episodic",
-                                    "confidence": node.confidence, "status": node.status.value,
-                                    "content": node.content, "agent_id": agent_id})
-        if node_type in ("all", "semantic"):
-            for node in self.semantic.values():
-                if node.agent_id == agent_id and node.confidence < threshold:
-                    results.append({"id": str(node.id), "node_type": "semantic",
-                                    "confidence": node.confidence, "status": node.status.value,
-                                    "content": node.content, "agent_id": agent_id})
-        return results
-
-    async def get_nearest_neighbors(self, embedding, agent_id, top_k=20, node_type="semantic"):
-        return await self.search_semantic(embedding, agent_id, top_k=top_k)
-
-    async def delete_agent_data(self, agent_id: str) -> int:
-        before = len(self.episodic) + len(self.semantic)
-        self.episodic = {k: v for k, v in self.episodic.items() if v.agent_id != agent_id}
-        self.semantic = {k: v for k, v in self.semantic.items() if v.agent_id != agent_id}
-        return before - len(self.episodic) - len(self.semantic)
-
-    async def export_agent_data(self, agent_id: str) -> dict:
-        return {
-            "episodic": [v.model_dump() for v in self.episodic.values() if v.agent_id == agent_id],
-            "semantic": [v.model_dump() for v in self.semantic.values() if v.agent_id == agent_id],
-        }
-
-    async def health_check(self) -> bool:
-        return True
-
-    async def initialize(self, embedding_dimensions: int = 1536) -> None:
-        pass
-
-class MockGraphStore(GraphStore):
-    def __init__(self):
-        self.nodes: dict[UUID, SemanticNode] = {}
-        self.conflicts: list[tuple[UUID, UUID]] = []
+    async def initialize(self) -> None:
+        pass  # stays unavailable
 
     async def upsert_node(self, node: SemanticNode) -> None:
-        self.nodes[node.id] = node
+        pass
 
     async def upsert_relation(self, from_id, to_id, relation_type, properties=None) -> None:
         pass
 
     async def get_node(self, node_id: UUID) -> Optional[SemanticNode]:
-        return self.nodes.get(node_id)
+        return None
 
-    async def get_neighbors(self, node_id, max_hops=2, relation_types=None):
+    async def get_neighbors(self, node_id, max_hops=2, relation_types=None) -> list:
         return []
 
-    async def find_conflicts(self, entity, relation, agent_id) -> list[SemanticNode]:
-        return [
-            n for n in self.nodes.values()
-            if n.entity == entity and n.relation == relation and n.agent_id == agent_id
-        ]
+    async def find_conflicts(self, entity, relation, agent_id) -> list:
+        return []
 
     async def mark_conflict(self, node_id_a, node_id_b) -> None:
-        self.conflicts.append((node_id_a, node_id_b))
+        pass
 
     async def resolve_conflict(self, winner_id, loser_id) -> None:
-        self.conflicts = [(a, b) for a, b in self.conflicts if a != loser_id and b != loser_id]
+        pass
 
     async def delete_agent_data(self, agent_id: str) -> int:
-        before = len(self.nodes)
-        self.nodes = {k: v for k, v in self.nodes.items() if v.agent_id != agent_id}
-        return before - len(self.nodes)
+        return 0
 
     async def export_agent_data(self, agent_id: str) -> dict:
         return {"nodes": [], "relations": []}
 
     async def health_check(self) -> bool:
-        return True
+        return False
+
+
+class _UnavailableCacheStore(CacheStore):
+    """Simulates Redis completely down. available=False, all ops are no-ops."""
+
+    def __init__(self) -> None:
+        self.available: bool = False
 
     async def initialize(self) -> None:
+        pass  # stays unavailable
+
+    async def set(self, key: str, value: Any, ttl_seconds: int = 3600) -> None:
         pass
 
-class MockCacheStore(CacheStore):
-    def __init__(self):
-        self._store: dict[str, Any] = {}
+    async def get(self, key: str) -> Optional[Any]:
+        return None
 
-    async def set(self, key, value, ttl_seconds=3600) -> None:
-        self._store[key] = value
+    async def delete(self, key: str) -> None:
+        pass
 
-    async def get(self, key) -> Optional[Any]:
-        return self._store.get(key)
-
-    async def delete(self, key) -> None:
-        self._store.pop(key, None)
-
-    async def exists(self, key) -> bool:
-        return key in self._store
+    async def exists(self, key: str) -> bool:
+        return False
 
     async def set_working_memory(self, agent_id, session_id, data, ttl_seconds=3600) -> None:
-        await self.set(f"shama:wm:{agent_id}:{session_id}", data, ttl_seconds)
+        pass
 
     async def get_working_memory(self, agent_id, session_id) -> Optional[dict]:
-        return await self.get(f"shama:wm:{agent_id}:{session_id}")
+        return None
 
     async def clear_working_memory(self, agent_id, session_id) -> None:
-        await self.delete(f"shama:wm:{agent_id}:{session_id}")
-
-    async def health_check(self) -> bool:
-        return True
-
-    async def initialize(self) -> None:
         pass
 
-class MockEmbeddingProvider(EmbeddingProvider):
-    async def embed(self, text: str) -> list[float]:
-        # Deterministic pseudo-embedding based on text length
-        base = [float(ord(c) % 10) / 10.0 for c in text[:1536]]
-        while len(base) < 1536:
-            base.append(0.0)
-        # Normalize
-        magnitude = math.sqrt(sum(x * x for x in base)) or 1.0
-        return [x / magnitude for x in base]
-
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        return [await self.embed(t) for t in texts]
-
-    @property
-    def dimensions(self) -> int:
-        return 1536
-
-class MockLLMProvider(LLMProvider):
-    def __init__(self, importance: float = 0.7):
-        self._importance = importance
-
-    async def complete(self, system, user, max_tokens=512, temperature=0.0) -> str:
-        return '{"verdict": "confirmed", "reasoning": "Still valid."}'
-
-    async def score_importance(self, content: str, context: str = "") -> float:
-        return self._importance
-
-    async def judge_contradiction(self, fact_a, fact_b, entity):
-        # Detect obvious contradictions by checking for opposite keywords
-        contradiction_pairs = [("Python", "JavaScript"), ("yes", "no"), ("prefers", "avoids")]
-        for a_word, b_word in contradiction_pairs:
-            if a_word in fact_a and b_word in fact_b:
-                return True, "a", f"{entity} prefers {a_word} over {b_word}"
-            if b_word in fact_a and a_word in fact_b:
-                return True, "b", f"{entity} prefers {a_word} over {b_word}"
-        return False, "neither", "No contradiction detected"
-
-    async def promote_to_semantic(self, episodic_contents, entity_hint=""):
-        return [{"entity": "user", "relation": "prefers", "value": "Python"}]
-
-class MockAuditStore(AuditStore):
-    def __init__(self):
-        self.events: list[AuditEvent] = []
-
-    async def write(self, event: AuditEvent) -> None:
-        self.events.append(event)
-
-    async def get_events(self, agent_id, event_types=None, since=None, limit=100):
-        return [e for e in self.events if e.agent_id == agent_id][:limit]
-
-    async def export_agent_audit(self, agent_id: str) -> list[dict]:
-        return [e.model_dump() for e in self.events if e.agent_id == agent_id]
-
     async def health_check(self) -> bool:
-        return True
+        return False
 
-    async def initialize(self) -> None:
-        pass
 
-# Fixtures
-@pytest.fixture
-def vector_store():
-    return MockVectorStore()
+#  Tests: Memory node models 
 
-@pytest.fixture
-def graph_store():
-    return MockGraphStore()
-
-@pytest.fixture
-def cache_store():
-    return MockCacheStore()
-
-@pytest.fixture
-def embedding_provider():
-    return MockEmbeddingProvider()
-
-@pytest.fixture
-def llm_provider():
-    return MockLLMProvider()
-
-@pytest.fixture
-def audit_store():
-    return MockAuditStore()
-
-@pytest.fixture
-def audit_logger(audit_store):
-    from shama.audit.logger import AuditLogger
-    return AuditLogger(audit_store)
-
-@pytest.fixture
-def writer(vector_store, graph_store, cache_store, embedding_provider, llm_provider, audit_logger):
-    from shama.memory.writer import MemoryWriter
-    return MemoryWriter(
-        vector_store=vector_store,
-        graph_store=graph_store,
-        cache_store=cache_store,
-        embedding_provider=embedding_provider,
-        llm_provider=llm_provider,
-        audit_logger=audit_logger,
-    )
-
-@pytest.fixture
-def retriever(vector_store, graph_store, cache_store, embedding_provider):
-    from shama.memory.retriever import MemoryRetriever
-    return MemoryRetriever(
-        vector_store=vector_store,
-        graph_store=graph_store,
-        cache_store=cache_store,
-        embedding_provider=embedding_provider,
-    )
-
-@pytest.fixture
-def contradiction_detector(vector_store, graph_store, llm_provider, audit_logger):
-    from shama.healing.contradiction import ContradictionDetector
-    return ContradictionDetector(
-        vector_store=vector_store,
-        graph_store=graph_store,
-        llm_provider=llm_provider,
-        audit_logger=audit_logger,
-    )
-
-@pytest.fixture
-def corrector(vector_store, graph_store, llm_provider, writer, audit_logger):
-    from shama.healing.corrector import SelfCorrector
-    return SelfCorrector(
-        vector_store=vector_store,
-        graph_store=graph_store,
-        llm_provider=llm_provider,
-        writer=writer,
-        audit_logger=audit_logger,
-    )
-
-@pytest.fixture
-def decay_engine(vector_store, writer):
-    return DecayEngine(vector_store=vector_store, writer=writer)
-
-# Tests: Models
 class TestMemoryNodeModels:
     def test_episodic_node_creation(self):
         node = EpisodicNode(
@@ -355,7 +134,7 @@ class TestMemoryNodeModels:
         assert node.content == "user prefers Python"
 
     def test_confidence_decay_formula(self):
-        """C(t) = C₀ × 2^(−t/τ) - validate at t=τ gives C₀/2"""
+        """C(t) = C₀ × 2^(−t/τ) - at t=τ gives C₀/2."""
         past_time = datetime.now(timezone.utc) - timedelta(hours=24)
         node = EpisodicNode(
             session_id=uuid4(),
@@ -365,7 +144,6 @@ class TestMemoryNodeModels:
             half_life_hours=24.0,
             created_at=past_time,
         )
-        # After one half-life, confidence should be ~0.5
         assert abs(node.current_confidence - 0.5) < 0.01
 
     def test_needs_reverification_flag(self):
@@ -396,7 +174,6 @@ class TestMemoryNodeModels:
             created_at=datetime.now(timezone.utc) - timedelta(hours=48),
             half_life_hours=24.0,
         )
-        # After 2 half-lives → 0.25
         assert abs(confidence - 0.25) < 0.01
 
     def test_hours_until_threshold(self):
@@ -405,13 +182,12 @@ class TestMemoryNodeModels:
             half_life_hours=24.0,
             threshold=0.5,
         )
-        assert abs(hours - 24.0) < 0.01  # should be exactly one half-life
+        assert abs(hours - 24.0) < 0.01
 
 
+#  Tests: Memory writer 
 
-# Tests: Memory writer
 class TestMemoryWriter:
-    @pytest.mark.asyncio
     async def test_write_episodic_node(self, writer, vector_store):
         node = await writer.write(
             content="User prefers concise code",
@@ -423,7 +199,6 @@ class TestMemoryWriter:
         assert node.content == "User prefers concise code"
         assert node.embedding is not None
 
-    @pytest.mark.asyncio
     async def test_write_semantic_node(self, writer, vector_store, graph_store):
         node = await writer.write_semantic(
             entity="user",
@@ -439,7 +214,6 @@ class TestMemoryWriter:
         assert node.relation == "prefers"
         assert node.value == "Python"
 
-    @pytest.mark.asyncio
     async def test_write_updates_working_memory(self, writer, cache_store):
         session_id = uuid4()
         await writer.write(
@@ -453,7 +227,6 @@ class TestMemoryWriter:
         assert len(wm["turns"]) == 1
         assert wm["turns"][0]["content"] == "Turn 1 content"
 
-    @pytest.mark.asyncio
     async def test_write_creates_audit_event(self, writer, audit_store):
         await writer.write(
             content="Test content",
@@ -464,7 +237,6 @@ class TestMemoryWriter:
         assert len(events) == 1
         assert events[0].event_type.value == "write"
 
-    @pytest.mark.asyncio
     async def test_deprecate_node(self, writer, vector_store):
         node = await writer.write(
             content="Stale fact",
@@ -477,15 +249,11 @@ class TestMemoryWriter:
             agent_id="agent-001",
             reason="Test deprecation",
         )
-        # Status update stored in vector store
-        stored = vector_store.episodic.get(node.id)
-        # Note: our mock doesn't fully propagate status updates - just checks the call completes
 
 
+#  Tests: Retriever 
 
-# Tests: Retriever
 class TestMemoryRetriever:
-    @pytest.mark.asyncio
     async def test_retrieve_returns_context(self, retriever, writer):
         agent_id = "agent-retrieve"
         session_id = uuid4()
@@ -501,7 +269,6 @@ class TestMemoryRetriever:
         assert context.query == "What does the user work with?"
         assert context.agent_id == agent_id
 
-    @pytest.mark.asyncio
     async def test_retrieve_empty_agent(self, retriever):
         context = await retriever.retrieve(
             query="anything",
@@ -510,59 +277,44 @@ class TestMemoryRetriever:
         assert context.total_results == 0
         assert context.memories == []
 
-    @pytest.mark.asyncio
     async def test_estimated_tokens(self, retriever, writer):
         agent_id = "agent-tokens"
         session_id = uuid4()
         await writer.write("A" * 400, agent_id=agent_id, session_id=session_id)
-
         context = await retriever.retrieve(query="test", agent_id=agent_id)
         assert context.estimated_tokens >= 0
 
 
+#  Tests: Contradiction detector 
 
-# Tests: Contradiction detector
 class TestContradictionDetector:
-    @pytest.mark.asyncio
     async def test_detects_same_triple_contradiction(
         self, contradiction_detector, vector_store, graph_store
     ):
         agent_id = "agent-conflict"
         session_id = uuid4()
 
-        # Write first semantic node
         node_a = SemanticNode(
-            session_id=session_id,
-            agent_id=agent_id,
-            content="user prefers Python",
-            entity="user",
-            relation="prefers",
-            value="Python",
-            embedding=[0.1] * 1536,
+            session_id=session_id, agent_id=agent_id,
+            content="user prefers Python", entity="user",
+            relation="prefers", value="Python", embedding=[0.1] * 1536,
         )
         await vector_store.upsert_semantic(node_a)
         await graph_store.upsert_node(node_a)
 
-        # Write conflicting node
         node_b = SemanticNode(
-            session_id=session_id,
-            agent_id=agent_id,
-            content="user prefers JavaScript",
-            entity="user",
-            relation="prefers",
-            value="JavaScript",
-            embedding=[0.2] * 1536,
+            session_id=session_id, agent_id=agent_id,
+            content="user prefers JavaScript", entity="user",
+            relation="prefers", value="JavaScript", embedding=[0.2] * 1536,
         )
         await vector_store.upsert_semantic(node_b)
         await graph_store.upsert_node(node_b)
 
-        # Scan for contradictions
         contradictions = await contradiction_detector.scan(node_b)
         assert len(contradictions) == 1
         assert contradictions[0].entity == "user"
         assert contradictions[0].relation == "prefers"
 
-    @pytest.mark.asyncio
     async def test_no_contradiction_same_value(
         self, contradiction_detector, vector_store, graph_store
     ):
@@ -587,24 +339,23 @@ class TestContradictionDetector:
         assert len(contradictions) == 0
 
 
+#  Tests: Self-corrector 
 
-# Tests: Self-corrector
 class TestSelfCorrector:
-    @pytest.mark.asyncio
-    async def test_reverify_confirmed(self, corrector, vector_store, writer):
+    async def test_reverify_confirmed(self, corrector, writer):
         agent_id = "agent-reverify"
         session_id = uuid4()
         node = await writer.write(
-            content="User is a senior engineer", agent_id=agent_id, session_id=session_id
+            content="User is a senior engineer",
+            agent_id=agent_id,
+            session_id=session_id,
         )
         result = await corrector.reverify_node(
             node_id=node.id, node_type="episodic", agent_id=agent_id
         )
-        # Mock LLM always returns "confirmed"
         from shama.core.models import ResolutionOutcome
         assert result.outcome == ResolutionOutcome.CONFIRMED
 
-    @pytest.mark.asyncio
     async def test_resolve_contradiction_winner_a(self, corrector, vector_store, graph_store):
         from shama.healing.contradiction import ContradictionResult
         from shama.core.models import ResolutionOutcome
@@ -636,49 +387,42 @@ class TestSelfCorrector:
         assert result.loser_id == node_b.id
 
 
-
-# Tests: Decay engine
+#  Tests: Decay engine
 class TestDecayEngine:
-    @pytest.mark.asyncio
     async def test_decay_pass_no_nodes(self, decay_engine):
         result = await decay_engine.run_decay_pass("agent-empty-decay")
         assert result.total_actioned == 0
 
-    @pytest.mark.asyncio
     async def test_decay_pass_deprecates_very_low_confidence(
-        self, decay_engine, vector_store, audit_store
+        self, decay_engine, vector_store
     ):
         agent_id = "agent-decay-test"
-        # Write a node with extremely low confidence
         node = EpisodicNode(
             session_id=uuid4(), agent_id=agent_id,
-            content="Old stale memory", confidence=0.05,  # below DEPRECATE_THRESHOLD=0.10
+            content="Old stale memory",
+            confidence=0.05,  # below DEPRECATE_THRESHOLD=0.10
             half_life_hours=24.0,
         )
         await vector_store.upsert_episodic(node)
-
         result = await decay_engine.run_decay_pass(agent_id)
         assert len(result.auto_deprecated) == 1
 
-    @pytest.mark.asyncio
     async def test_decay_pass_queues_mid_confidence_for_reverify(
         self, decay_engine, vector_store
     ):
         agent_id = "agent-mid-confidence"
-        # Confidence between DEPRECATE (0.10) and REVERIFY (0.30)
         node = EpisodicNode(
             session_id=uuid4(), agent_id=agent_id,
-            content="Somewhat old memory", confidence=0.20,
+            content="Somewhat old memory",
+            confidence=0.20,  # between DEPRECATE (0.10) and REVERIFY (0.30)
             half_life_hours=24.0,
         )
         await vector_store.upsert_episodic(node)
-
         result = await decay_engine.run_decay_pass(agent_id)
         assert len(result.queued_for_reverify) == 1
 
-# Tests: Audit logger
+#  Tests: Audit logger 
 class TestAuditLogger:
-    @pytest.mark.asyncio
     async def test_log_write_event(self, audit_logger, audit_store):
         node_id = uuid4()
         await audit_logger.log_write(
@@ -691,7 +435,6 @@ class TestAuditLogger:
         assert events[0].event_type.value == "write"
         assert node_id in events[0].node_ids
 
-    @pytest.mark.asyncio
     async def test_log_contradiction_event(self, audit_logger, audit_store):
         ids = [uuid4(), uuid4()]
         await audit_logger.log_contradiction(
@@ -703,7 +446,6 @@ class TestAuditLogger:
         assert events[0].event_type.value == "contradiction"
         assert events[0].new_status == MemoryStatus.CONTESTED
 
-    @pytest.mark.asyncio
     async def test_log_decay_event(self, audit_logger, audit_store):
         node_id = uuid4()
         await audit_logger.log_decay(
@@ -716,7 +458,7 @@ class TestAuditLogger:
         assert events[0].old_confidence == 0.8
         assert events[0].new_confidence == 0.35
 
-# Tests: Config
+#  Tests: Config
 class TestShamaConfig:
     def test_default_config_values(self):
         config = ShamaConfig()
@@ -732,3 +474,328 @@ class TestShamaConfig:
         )
         assert config.REVERIFY_THRESHOLD == 0.50
         assert config.EPISODIC_HALF_LIFE == 12.0
+
+#  Tests: Phase 1.2 - Graceful backend degradation 
+class TestDegradedMode:
+    """
+    Verifies SHAMA continues operating when Neo4j or Redis is unavailable.
+    Uses _UnavailableGraphStore / _UnavailableCacheStore defined at the top
+    of this file - NOT imported from conftest (conftest is not importable).
+    """
+
+    async def test_redis_down_write_still_succeeds(
+        self, vector_store, graph_store, embedding_provider, llm_provider, audit_store
+    ):
+        """Writing episodic memory must succeed even when Redis is down."""
+        from shama.client import ShamaClient
+
+        down_cache = _UnavailableCacheStore()
+        client = ShamaClient.from_components(
+            vector_store=vector_store,
+            graph_store=graph_store,
+            cache_store=down_cache,
+            embedding_provider=embedding_provider,
+            llm_provider=llm_provider,
+            audit_store=audit_store,
+        )
+        await client.initialize()
+        assert down_cache.available is False
+
+        node = await client.remember(
+            content="Test memory with Redis down",
+            agent_id="agent-degraded-cache",
+            session_id=uuid4(),
+        )
+        assert node.id is not None
+        assert node.id in vector_store.episodic
+
+    async def test_redis_down_health_check_reflects_state(
+        self, vector_store, graph_store, embedding_provider, llm_provider, audit_store
+    ):
+        """health_check() must return cache_store: False when Redis is down."""
+        from shama.client import ShamaClient
+
+        down_cache = _UnavailableCacheStore()
+        client = ShamaClient.from_components(
+            vector_store=vector_store,
+            graph_store=graph_store,
+            cache_store=down_cache,
+            embedding_provider=embedding_provider,
+            llm_provider=llm_provider,
+            audit_store=audit_store,
+        )
+        await client.initialize()
+
+        health = await client.health_check()
+        assert health["vector_store"] is True
+        assert health["cache_store"] is False
+        assert health["audit_store"] is True
+
+    async def test_neo4j_down_write_still_succeeds(
+        self, vector_store, cache_store, embedding_provider, llm_provider, audit_store
+    ):
+        """Writing semantic facts must succeed even when Neo4j is down."""
+        from shama.client import ShamaClient
+
+        down_graph = _UnavailableGraphStore()
+        client = ShamaClient.from_components(
+            vector_store=vector_store,
+            graph_store=down_graph,
+            cache_store=cache_store,
+            embedding_provider=embedding_provider,
+            llm_provider=llm_provider,
+            audit_store=audit_store,
+        )
+        await client.initialize()
+        assert down_graph.available is False
+
+        node = await client.remember_fact(
+            entity="user",
+            relation="language",
+            value="Python",
+            agent_id="agent-degraded-graph",
+            session_id=uuid4(),
+        )
+        assert node.id is not None
+        assert node.id in vector_store.semantic
+
+    async def test_neo4j_down_contradiction_scan_skipped(
+        self, vector_store, cache_store, embedding_provider, llm_provider, audit_store
+    ):
+        """
+        When Neo4j is down, remember_fact() must skip contradiction scanning
+        and return the node - not raise, even with contradicting facts.
+        """
+        from shama.client import ShamaClient
+
+        down_graph = _UnavailableGraphStore()
+        client = ShamaClient.from_components(
+            vector_store=vector_store,
+            graph_store=down_graph,
+            cache_store=cache_store,
+            embedding_provider=embedding_provider,
+            llm_provider=llm_provider,
+            audit_store=audit_store,
+        )
+        await client.initialize()
+
+        await client.remember_fact(
+            entity="user", relation="prefers_lang", value="Python",
+            agent_id="agent-no-graph", session_id=uuid4(),
+        )
+        node = await client.remember_fact(
+            entity="user", relation="prefers_lang", value="JavaScript",
+            agent_id="agent-no-graph", session_id=uuid4(),
+        )
+        assert node.id is not None
+
+    async def test_neo4j_down_health_check_reflects_state(
+        self, vector_store, cache_store, embedding_provider, llm_provider, audit_store
+    ):
+        """health_check() must return graph_store: False when Neo4j is down."""
+        from shama.client import ShamaClient
+
+        down_graph = _UnavailableGraphStore()
+        client = ShamaClient.from_components(
+            vector_store=vector_store,
+            graph_store=down_graph,
+            cache_store=cache_store,
+            embedding_provider=embedding_provider,
+            llm_provider=llm_provider,
+            audit_store=audit_store,
+        )
+        await client.initialize()
+
+        health = await client.health_check()
+        assert health["vector_store"] is True
+        assert health["graph_store"] is False
+        assert health["cache_store"] is True
+
+    async def test_both_redis_and_neo4j_down(
+        self, vector_store, embedding_provider, llm_provider, audit_store
+    ):
+        """SHAMA must still write and recall when both Redis and Neo4j are down."""
+        from shama.client import ShamaClient
+
+        client = ShamaClient.from_components(
+            vector_store=vector_store,
+            graph_store=_UnavailableGraphStore(),
+            cache_store=_UnavailableCacheStore(),
+            embedding_provider=embedding_provider,
+            llm_provider=llm_provider,
+            audit_store=audit_store,
+        )
+        await client.initialize()
+
+        node = await client.remember(
+            content="Memory with both backends down",
+            agent_id="agent-double-degraded",
+            session_id=uuid4(),
+        )
+        assert node.id is not None
+
+        context = await client.recall(
+            query="test query",
+            agent_id="agent-double-degraded",
+        )
+        assert context is not None
+
+    async def test_store_available_flag_true_by_default(self, graph_store, cache_store):
+        """Normal mock stores must start with available=True."""
+        assert graph_store.available is True
+        assert cache_store.available is True
+
+
+#  Tests: Phase 1.3 - LLM retry + timeout logic 
+class TestLLMRetry:
+    """
+    Verifies the _LLMRetryMixin behaviour.
+    Import path: shama.providers.llm (the llm.py module file, NOT a sub-package).
+    """
+
+    async def test_succeeds_on_first_attempt(self):
+        """Happy path - no retries needed."""
+        from shama.providers.llm import _LLMRetryMixin
+
+        class _Provider(_LLMRetryMixin):
+            _provider_name = "Test"
+            async def _raw(self) -> str:
+                return "ok"
+
+        result = await _Provider()._call_with_retry(_Provider()._raw)
+        assert result == "ok"
+
+    async def test_retries_on_transient_error_and_succeeds(self):
+        """Fails once, succeeds on second attempt."""
+        from shama.providers.llm import _LLMRetryMixin
+
+        call_count = 0
+
+        class _Provider(_LLMRetryMixin):
+            _provider_name = "Test"
+            async def _raw(self) -> str:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise RuntimeError("500 server error")
+                return "recovered"
+
+        p = _Provider()
+        result = await p._call_with_retry(p._raw)
+        assert result == "recovered"
+        assert call_count == 2
+
+    async def test_raises_llm_unavailable_after_all_retries(self):
+        """Fails on all 3 attempts - must raise LLMUnavailableError."""
+        from shama.providers.llm import _LLMRetryMixin
+
+        call_count = 0
+
+        class _Provider(_LLMRetryMixin):
+            _provider_name = "Test"
+            async def _raw(self) -> str:
+                nonlocal call_count
+                call_count += 1
+                raise RuntimeError("persistent 503")
+
+        p = _Provider()
+        with pytest.raises(LLMUnavailableError) as exc_info:
+            await p._call_with_retry(p._raw)
+
+        assert call_count == 3
+        assert "Test" in str(exc_info.value)
+        assert "3" in str(exc_info.value)
+
+    async def test_auth_error_raises_immediately_no_retry(self):
+        """401 auth error must fail fast - no retry wasted."""
+        from shama.providers.llm import _LLMRetryMixin
+
+        call_count = 0
+
+        class _Provider(_LLMRetryMixin):
+            _provider_name = "Test"
+            async def _raw(self) -> str:
+                nonlocal call_count
+                call_count += 1
+                raise RuntimeError("401 invalid_api_key")
+
+        p = _Provider()
+        with pytest.raises(LLMUnavailableError) as exc_info:
+            await p._call_with_retry(p._raw)
+
+        assert call_count == 1  # no retry on auth failure
+        error_msg = str(exc_info.value).lower()
+        assert "authentication" in error_msg or "api key" in error_msg
+
+    async def test_timeout_triggers_retry(self):
+        """asyncio.TimeoutError on attempt 1 must trigger retry."""
+        from shama.providers.llm import _LLMRetryMixin
+
+        call_count = 0
+
+        class _Provider(_LLMRetryMixin):
+            _provider_name = "Test"
+            async def _raw(self) -> str:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise asyncio.TimeoutError()
+                return "ok after timeout"
+
+        p = _Provider()
+        result = await p._call_with_retry(p._raw)
+        assert result == "ok after timeout"
+        assert call_count == 2
+
+    async def test_llm_unavailable_error_exported_from_package(self):
+        """LLMUnavailableError must be importable from the top-level shama package."""
+        from shama import LLMUnavailableError as PublicError
+        assert PublicError is LLMUnavailableError
+
+    async def test_llm_unavailable_is_shama_error(self):
+        """LLMUnavailableError must be a subclass of ShamaError."""
+        from shama.core.exceptions import ShamaError
+        assert issubclass(LLMUnavailableError, ShamaError)
+
+
+#  Tests: Phase 1.2 - store available flag on real classes 
+class TestStoreAvailability:
+    """
+    Tests the available flag on real store classes without needing Docker.
+    Sets available=False manually to simulate a failed initialize().
+    """
+
+    async def test_redis_available_false_health_check_returns_false(self):
+        from shama.stores.cache.redis import RedisCacheStore
+        store = RedisCacheStore(url="redis://localhost:6379")
+        store.available = False
+        assert await store.health_check() is False
+
+    async def test_redis_available_false_set_is_noop(self):
+        from shama.stores.cache.redis import RedisCacheStore
+        store = RedisCacheStore(url="redis://localhost:6379")
+        store.available = False
+        # Must not raise
+        await store.set("key", "value")
+        result = await store.get("key")
+        assert result is None
+
+    async def test_neo4j_available_false_find_conflicts_returns_empty(self):
+        from shama.stores.graph.neo4j import Neo4jGraphStore
+        store = Neo4jGraphStore()
+        store.available = False
+        result = await store.find_conflicts("user", "prefers", "agent-001")
+        assert result == []
+
+    async def test_neo4j_available_false_get_neighbors_returns_empty(self):
+        from shama.stores.graph.neo4j import Neo4jGraphStore
+        store = Neo4jGraphStore()
+        store.available = False
+        result = await store.get_neighbors(uuid4())
+        assert result == []
+
+    async def test_neo4j_available_false_health_check_returns_false(self):
+        from shama.stores.graph.neo4j import Neo4jGraphStore
+        store = Neo4jGraphStore()
+        store.available = False
+        assert await store.health_check() is False

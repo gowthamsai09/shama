@@ -331,13 +331,37 @@ class ShamaClient:
         """
         Initialize all backend connections.
         Must be called once before any other method.
+        Qdrant is non-negotiable - raises if unavailable.
+        Neo4j and Redis degrade gracefully with warnings.
         """
         dimensions = getattr(self, "_embedding_dimensions", 1536)
+
+        # Qdrant: non-negotiable - raises immediately if down
         await self._vector.initialize(embedding_dimensions=dimensions)
+
+        # Neo4j: graceful - sets self._graph.available = False if down
         await self._graph.initialize()
+        if not self._graph.available:
+            logger.warning(
+                "SHAMA running in DEGRADED MODE: Neo4j unavailable. "
+                "Graph hops in recall disabled. Contradiction scanning disabled."
+            )
+
+        # Redis: graceful - sets self._cache.available = False if down
         await self._cache.initialize()
+        if not self._cache.available:
+            logger.warning(
+                "SHAMA running in DEGRADED MODE: Redis unavailable. "
+                "Working memory cache disabled. Core memory operations continue."
+            )
+
         await self._audit_logger._store.initialize()
-        logger.info("SHAMA client initialized successfully")
+        logger.info(
+            "SHAMA client initialized - vector=%s graph=%s cache=%s",
+            True,
+            self._graph.available,
+            self._cache.available,
+        )
 
     
     # Core public API
@@ -406,13 +430,15 @@ class ShamaClient:
             metadata=metadata,
         )
 
-        # Trigger contradiction scan
-        contradictions = await self._contradiction_detector.scan(node)
-        for contradiction in contradictions:
-            # Enqueue resolution - in production this goes to Celery
-            # For sync usage, resolve immediately
-            await self._corrector.resolve_contradiction(contradiction)
-
+        # Trigger contradiction scan - skipped if Neo4j is unavailable
+        if self._graph.available:
+            contradictions = await self._contradiction_detector.scan(node)
+            for contradiction in contradictions:
+                await self._corrector.resolve_contradiction(contradiction)
+        else:
+            logger.debug(
+                "Contradiction scan skipped for node %s - Neo4j unavailable", node.id
+            )
         return node
 
     async def recall(
@@ -518,6 +544,8 @@ class ShamaClient:
         """
         Check health of all backend connections.
         Returns dict of component → healthy bool.
+        Note: False for Neo4j or Redis means degraded mode, not a crash.
+        False for vector_store means SHAMA is non-functional.
         """
         return {
             "vector_store": await self._vector.health_check(),

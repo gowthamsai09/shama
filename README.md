@@ -27,21 +27,22 @@ SHAMA is a **drop-in memory layer** that gives your agent:
 
 ## Table of Contents
 
-- [SHAMA - Self-Healing Agent Memory Architecture](#shama--self-healing-agent-memory-architecture)
+- [SHAMA - Self-Healing Agent Memory Architecture](#shama---self-healing-agent-memory-architecture)
   - [The Problem](#the-problem)
   - [The Solution](#the-solution)
   - [Table of Contents](#table-of-contents)
   - [Architecture](#architecture)
     - [Confidence Half-Life](#confidence-half-life)
   - [Prerequisites](#prerequisites)
-  - [Step 1 - Get API Keys](#step-1--get-api-keys)
-    - [Embedding Key - OpenAI (required)](#embedding-key--openai-required)
-    - [LLM Key - DeepSeek (for reasoning, contradiction judging, promotion)](#llm-key--deepseek-for-reasoning-contradiction-judging-promotion)
-  - [Step 2 - Clone \& Install](#step-2--clone--install)
-    - [HuggingFace - Fully Local (no API keys, full privacy)](#huggingface--fully-local-no-api-keys-full-privacy)
-  - [Step 3 - Configure Environment](#step-3--configure-environment)
-  - [Step 4 - Start Infrastructure (Docker)](#step-4--start-infrastructure-docker)
-  - [Step 5 - Verify Infrastructure](#step-5--verify-infrastructure)
+  - [Step 1 - Get API Keys](#step-1---get-api-keys)
+    - [Embedding Key - OpenAI (required)](#embedding-key---openai-required)
+    - [LLM Key - DeepSeek (for reasoning, contradiction judging, promotion)](#llm-key---deepseek-for-reasoning-contradiction-judging-promotion)
+    - [HuggingFace - Fully Local (no API keys, full privacy) or use Hugging face free API](#huggingface---fully-local-no-api-keys-full-privacy-or-use-hugging-face-free-api)
+  - [For local usage](#for-local-usage)
+  - [Step 2 - Clone \& Install](#step-2---clone--install)
+  - [Step 3 - Configure Environment](#step-3---configure-environment)
+  - [Step 4 - Start Infrastructure (Docker)](#step-4---start-infrastructure-docker)
+  - [Step 5 - Verify Infrastructure](#step-5---verify-infrastructure)
     - [Qdrant](#qdrant)
     - [Neo4j](#neo4j)
     - [Redis](#redis)
@@ -220,7 +221,7 @@ pip install shama[huggingface-local]
 Verify installation:
 ```bash
 python -c "import shama; print(shama.__version__)"
-# Expected: 0.1.1
+# Expected: 0.1.2
 ```
 
 ---
@@ -229,7 +230,7 @@ python -c "import shama; print(shama.__version__)"
 
 ```bash
 # Copy the example env file
-cp .env
+cp .env.example .env
 ```
 
 Open `.env` and fill in your values:

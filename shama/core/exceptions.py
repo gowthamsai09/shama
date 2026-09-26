@@ -49,3 +49,6 @@ class AgentNotFoundError(ShamaError):
 
 class TokenBudgetExceededError(ShamaError):
     """Assembled context exceeds the configured token budget."""
+
+class LLMUnavailableError(ShamaError):
+    """LLM provider failed after all retries. Includes provider name and last error."""

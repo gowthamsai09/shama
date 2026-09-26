@@ -19,17 +19,22 @@ Install:
 """
 
 from __future__ import annotations
+import asyncio
 import json
 import logging
 from typing import Any
 from shama.core.interfaces import EmbeddingProvider, LLMProvider
+from shama.core.exceptions import LLMUnavailableError
+from shama.providers.llm import _LLMRetryMixin
 logger = logging.getLogger(__name__)
 
-# HuggingFace Inference API - LLM provider
-class HuggingFaceLLMProvider(LLMProvider):
+
+#  HuggingFace Inference API - LLM provider 
+class HuggingFaceLLMProvider(_LLMRetryMixin, LLMProvider):
     """
     HuggingFace Inference API as LLM judge.
     Uses huggingface_hub InferenceClient - supports all text-generation models.
+    All LLM calls go through _call_with_retry() for automatic retry + timeout.
 
     Recommended models for SHAMA (good reasoning, instruction-following):
       - mistralai/Mistral-7B-Instruct-v0.3       (free tier available)
@@ -45,6 +50,7 @@ class HuggingFaceLLMProvider(LLMProvider):
             fast_model="mistralai/Mistral-7B-Instruct-v0.3",
         )
     """
+    _provider_name = "HuggingFace"
 
     def __init__(
         self,
@@ -68,24 +74,6 @@ class HuggingFaceLLMProvider(LLMProvider):
             )
         return self._client
 
-    async def complete(
-        self,
-        system: str,
-        user: str,
-        max_tokens: int = 512,
-        temperature: float = 0.0,
-    ) -> str:
-        """
-        HuggingFace Inference API is synchronous - we wrap in asyncio.
-        For production async usage, run in a thread pool executor.
-        """
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self._complete_sync(system, user, max_tokens, temperature, self._judge_model),
-        )
-
     def _complete_sync(
         self,
         system: str,
@@ -94,25 +82,41 @@ class HuggingFaceLLMProvider(LLMProvider):
         temperature: float,
         model: str,
     ) -> str:
+        """Synchronous HF API call. Always called via run_in_executor."""
         client = self._get_client()
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        try:
-            response = client.chat_completion(
-                messages=messages,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=max(temperature, 0.01),  # HF API requires > 0
+        response = client.chat_completion(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=max(temperature, 0.01),  # HF API requires > 0
+        )
+        return response.choices[0].message.content or ""
+
+    async def complete(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> str:
+        """
+        HuggingFace Inference API is synchronous - wrapped in asyncio executor.
+        Retried automatically via _call_with_retry() on timeout or server errors.
+        """
+        async def _raw() -> str:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: self._complete_sync(system, user, max_tokens, temperature, self._judge_model),
             )
-            return response.choices[0].message.content or ""
-        except Exception as exc:
-            logger.error("HuggingFace LLM complete failed: %s", exc)
-            raise
+
+        return await self._call_with_retry(_raw)
 
     async def score_importance(self, content: str, context: str = "") -> float:
-        import asyncio
         system = (
             "You score the importance of information for an AI agent's long-term memory. "
             "Reply ONLY with a JSON object: {\"score\": <float 0.0-1.0>}. "
@@ -121,20 +125,25 @@ class HuggingFaceLLMProvider(LLMProvider):
         user = f"Rate this for long-term memory importance:\n{content}"
         if context:
             user += f"\n\nContext: {context}"
-        try:
+
+        async def _raw() -> str:
             loop = asyncio.get_event_loop()
-            raw = await loop.run_in_executor(
+            return await loop.run_in_executor(
                 None,
                 lambda: self._complete_sync(system, user, 50, 0.01, self._fast_model),
             )
+        try:
+            raw = await self._call_with_retry(_raw)
             clean = raw.strip().replace("```json", "").replace("```", "").strip()
             # Extract JSON - HF models sometimes add preamble text
             start = clean.find("{")
-            end   = clean.rfind("}") + 1
+            end = clean.rfind("}") + 1
             if start != -1 and end > start:
                 parsed = json.loads(clean[start:end])
                 return float(max(0.0, min(1.0, parsed.get("score", 0.5))))
             return 0.5
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
             logger.warning("HuggingFace importance scoring failed: %s - defaulting 0.5", exc)
             return 0.5
@@ -158,7 +167,7 @@ class HuggingFaceLLMProvider(LLMProvider):
             raw = await self.complete(system=system, user=user, max_tokens=200)
             clean = raw.strip().replace("```json", "").replace("```", "").strip()
             start = clean.find("{")
-            end   = clean.rfind("}") + 1
+            end = clean.rfind("}") + 1
             if start != -1 and end > start:
                 parsed = json.loads(clean[start:end])
                 return (
@@ -167,6 +176,8 @@ class HuggingFaceLLMProvider(LLMProvider):
                     str(parsed.get("reasoning", "")),
                 )
             return False, "neither", "Could not parse judge response"
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
             logger.warning("HuggingFace contradiction judge failed: %s", exc)
             return False, "neither", f"Judge call failed: {exc}"
@@ -189,7 +200,7 @@ class HuggingFaceLLMProvider(LLMProvider):
             raw = await self.complete(system=system, user=user, max_tokens=500)
             clean = raw.strip().replace("```json", "").replace("```", "").strip()
             start = clean.find("[")
-            end   = clean.rfind("]") + 1
+            end = clean.rfind("]") + 1
             if start != -1 and end > start:
                 parsed = json.loads(clean[start:end])
                 return [
@@ -197,17 +208,19 @@ class HuggingFaceLLMProvider(LLMProvider):
                     if isinstance(t, dict) and t.get("entity") and t.get("relation") and t.get("value")
                 ] if isinstance(parsed, list) else []
             return []
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
             logger.warning("HuggingFace promotion failed: %s", exc)
             return []
 
 
-
-# HuggingFace Local LLM - runs transformers on your machine
-class HuggingFaceLocalLLMProvider(LLMProvider):
+#  HuggingFace Local LLM - runs transformers on your machine 
+class HuggingFaceLocalLLMProvider(_LLMRetryMixin, LLMProvider):
     """
     Runs a HuggingFace model locally using the transformers library.
     Zero API cost. Full data privacy. Needs GPU for good performance.
+    All LLM calls go through _call_with_retry() for automatic retry + timeout.
 
     Requires:
         pip install transformers torch accelerate sentencepiece bitsandbytes
@@ -225,6 +238,7 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
         )
         # First run downloads the model (~3-14GB depending on model)
     """
+    _provider_name = "HuggingFaceLocal"
 
     def __init__(
         self,
@@ -241,7 +255,10 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
 
     def _get_pipeline(self):
         if self._pipeline is None:
-            logger.info("Loading local HuggingFace model: %s (first load may take a few minutes)", self._model_name)
+            logger.info(
+                "Loading local HuggingFace model: %s (first load may take a few minutes)",
+                self._model_name,
+            )
             import torch
             from transformers import pipeline, BitsAndBytesConfig
 
@@ -262,21 +279,10 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
             logger.info("Local model loaded: %s", self._model_name)
         return self._pipeline
 
-    async def complete(
-        self,
-        system: str,
-        user: str,
-        max_tokens: int = 512,
-        temperature: float = 0.0,
+    def _complete_sync(
+        self, system: str, user: str, max_tokens: int, temperature: float
     ) -> str:
-        import asyncio
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: self._complete_sync(system, user, max_tokens, temperature),
-        )
-
-    def _complete_sync(self, system: str, user: str, max_tokens: int, temperature: float) -> str:
+        """Synchronous local inference call. Always called via run_in_executor."""
         pipe = self._get_pipeline()
         messages = [
             {"role": "system", "content": system},
@@ -296,6 +302,26 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
             return generated[-1].get("content", "") if generated else ""
         return str(generated)
 
+    async def complete(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> str:
+        """
+        Local inference runs in a thread pool executor to avoid blocking the event loop.
+        Retried automatically via _call_with_retry() on timeout or failures.
+        """
+        async def _raw() -> str:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: self._complete_sync(system, user, max_tokens, temperature),
+            )
+
+        return await self._call_with_retry(_raw)
+
     async def score_importance(self, content: str, context: str = "") -> float:
         system = (
             "Score importance for AI agent long-term memory. "
@@ -306,11 +332,13 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
             raw = await self.complete(system=system, user=user, max_tokens=50)
             clean = raw.strip()
             start = clean.find("{")
-            end   = clean.rfind("}") + 1
+            end = clean.rfind("}") + 1
             if start != -1 and end > start:
                 parsed = json.loads(clean[start:end])
                 return float(max(0.0, min(1.0, parsed.get("score", 0.5))))
             return 0.5
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
             logger.warning("Local HF importance scoring failed: %s", exc)
             return 0.5
@@ -327,7 +355,7 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
             raw = await self.complete(system=system, user=user, max_tokens=200)
             clean = raw.strip()
             start = clean.find("{")
-            end   = clean.rfind("}") + 1
+            end = clean.rfind("}") + 1
             if start != -1 and end > start:
                 parsed = json.loads(clean[start:end])
                 return (
@@ -336,7 +364,10 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
                     str(parsed.get("reasoning", "")),
                 )
             return False, "neither", "Could not parse response"
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
+            logger.warning("Local HF contradiction judge failed: %s", exc)
             return False, "neither", f"Local judge failed: {exc}"
 
     async def promote_to_semantic(
@@ -354,22 +385,23 @@ class HuggingFaceLocalLLMProvider(LLMProvider):
             raw = await self.complete(system=system, user=user, max_tokens=500)
             clean = raw.strip()
             start = clean.find("[")
-            end   = clean.rfind("]") + 1
+            end = clean.rfind("]") + 1
             if start != -1 and end > start:
                 parsed = json.loads(clean[start:end])
                 return parsed if isinstance(parsed, list) else []
             return []
+        except LLMUnavailableError:
+            raise
         except Exception as exc:
             logger.warning("Local HF promotion failed: %s", exc)
             return []
 
-
-
-# HuggingFace Inference API - Embedding provider
+#  HuggingFace Inference API - Embedding provider 
 class HuggingFaceEmbeddingProvider(EmbeddingProvider):
     """
     HuggingFace Inference API for embeddings.
     Uses feature-extraction pipeline via InferenceClient.
+    No retry mixin - embedding failures are handled by the caller (MemoryWriter).
 
     Recommended embedding models:
       - BAAI/bge-large-en-v1.5          (1024 dims, top MTEB score, recommended)
@@ -386,15 +418,15 @@ class HuggingFaceEmbeddingProvider(EmbeddingProvider):
 
     # Known dimensions for common models
     MODEL_DIMS: dict[str, int] = {
-        "BAAI/bge-large-en-v1.5":                   1024,
-        "BAAI/bge-base-en-v1.5":                     768,
-        "BAAI/bge-small-en-v1.5":                    384,
-        "sentence-transformers/all-MiniLM-L6-v2":    384,
-        "sentence-transformers/all-mpnet-base-v2":   768,
-        "thenlper/gte-large":                        1024,
-        "thenlper/gte-base":                          768,
-        "intfloat/e5-large-v2":                      1024,
-        "intfloat/multilingual-e5-large":            1024,
+        "BAAI/bge-large-en-v1.5":                  1024,
+        "BAAI/bge-base-en-v1.5":                    768,
+        "BAAI/bge-small-en-v1.5":                   384,
+        "sentence-transformers/all-MiniLM-L6-v2":   384,
+        "sentence-transformers/all-mpnet-base-v2":  768,
+        "thenlper/gte-large":                       1024,
+        "thenlper/gte-base":                         768,
+        "intfloat/e5-large-v2":                     1024,
+        "intfloat/multilingual-e5-large":           1024,
     }
 
     def __init__(
@@ -419,21 +451,18 @@ class HuggingFaceEmbeddingProvider(EmbeddingProvider):
         return self._client
 
     async def embed(self, text: str) -> list[float]:
-        import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: self._embed_sync(text))
 
     def _embed_sync(self, text: str) -> list[float]:
         client = self._get_client()
         result = client.feature_extraction(
-            text=text[:512],          # most HF models cap at 512 tokens
+            text=text[:512],   # most HF models cap at 512 tokens
             model=self._model,
         )
-        # result can be nested list - flatten to 1D
         return self._flatten(result)
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        import asyncio
         loop = asyncio.get_event_loop()
         # HF Inference API doesn't support true batch - run sequentially
         results = []
@@ -460,11 +489,12 @@ class HuggingFaceEmbeddingProvider(EmbeddingProvider):
             return arr[0].mean(axis=0).tolist()
         return arr.flatten().tolist()
 
-# HuggingFace Local Embeddings - sentence-transformers on your machine
+#  HuggingFace Local Embeddings - sentence-transformers on your machine 
 class HuggingFaceLocalEmbeddingProvider(EmbeddingProvider):
     """
     Local embeddings using sentence-transformers library.
     Zero API cost. Full data privacy. CPU-friendly.
+    No retry mixin - local model failures are deterministic (model not loaded etc.) and handled by the caller.
 
     Requires:
         pip install sentence-transformers
@@ -483,13 +513,13 @@ class HuggingFaceLocalEmbeddingProvider(EmbeddingProvider):
     """
 
     MODEL_DIMS: dict[str, int] = {
-        "BAAI/bge-large-en-v1.5":                   1024,
-        "BAAI/bge-base-en-v1.5":                     768,
-        "BAAI/bge-small-en-v1.5":                    384,
-        "sentence-transformers/all-MiniLM-L6-v2":    384,
-        "sentence-transformers/all-mpnet-base-v2":   768,
-        "thenlper/gte-large":                        1024,
-        "thenlper/gte-base":                          768,
+        "BAAI/bge-large-en-v1.5":                  1024,
+        "BAAI/bge-base-en-v1.5":                    768,
+        "BAAI/bge-small-en-v1.5":                   384,
+        "sentence-transformers/all-MiniLM-L6-v2":   384,
+        "sentence-transformers/all-mpnet-base-v2":  768,
+        "thenlper/gte-large":                       1024,
+        "thenlper/gte-base":                         768,
     }
 
     def __init__(
@@ -513,7 +543,6 @@ class HuggingFaceLocalEmbeddingProvider(EmbeddingProvider):
         return self._model
 
     async def embed(self, text: str) -> list[float]:
-        import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: self._embed_sync(text))
 
@@ -523,7 +552,6 @@ class HuggingFaceLocalEmbeddingProvider(EmbeddingProvider):
         return embedding.tolist()
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        import asyncio
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, lambda: self._embed_batch_sync(texts))
 

@@ -12,7 +12,7 @@ from shama.core.models import (
 )
 from shama.core.exceptions import (
     ShamaError, StoreConnectionError,
-    MemoryWriteError, MemoryNotFoundError, ContradictionError,
+    MemoryWriteError, MemoryNotFoundError, ContradictionError,LLMUnavailableError
 )
 from shama.providers.huggingface import (
     HuggingFaceLLMProvider,
@@ -21,13 +21,13 @@ from shama.providers.huggingface import (
     HuggingFaceLocalEmbeddingProvider,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = [
     "ShamaClient", "ShamaConfig",
     "EpisodicNode", "SemanticNode", "MemoryResult",
     "RetrievedContext", "MemorySource", "MemoryStatus",
     "AuditEvent", "ShamaError", "StoreConnectionError",
     "MemoryWriteError", "MemoryNotFoundError", "ContradictionError",
-    "HuggingFaceLLMProvider","HuggingFaceLocalLLMProvider",
+    "LLMUnavailableError","HuggingFaceLLMProvider","HuggingFaceLocalLLMProvider",
     "HuggingFaceEmbeddingProvider","HuggingFaceLocalEmbeddingProvider",
 ]
